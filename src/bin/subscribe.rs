@@ -1,32 +1,30 @@
-use alloy::{
-    primitives::{keccak256, Address},
-    providers::{Provider, ProviderBuilder},
-    rpc::types::Filter,
-};
+use alloy::{primitives::{keccak256,Address}, providers::{Provider, ProviderBuilder}, rpc::types::Filter};
 use serde_json::Value;
-use std::{fs, str::FromStr};
+use std::{fs, str::FromStr,thread::{self, current}};
 use tokio::time::{sleep, Duration};
 
-const CHAIN_A_URL: &str = "http://localhost:8545";
-const CHECKPOINT_PATH: &str = "data/subscriber_checkpoint.json";
+
+
+static CHAINA_URL: &str = "http://localhost:8545";
 
 struct ProcessedTransaction{
     block_number: u64,
     tx_hash: String,
     log_index: u64,
 }
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              static CHECKPOINT_PATH: &str = "data/subscriber_checkpoint.json";
+
 
 #[tokio::main]
 async fn main(){
     let deposit_abi_path: &str = "../relayerContracts/data/Deposit.abi.json";
-    let abi_string: String = fs::read_to_string(deposit_abi_path).expect("Can not read Deposit ABI");
+    let abiString: String = fs::read_to_string(deposit_abi_path).expect("Can not read Deposit ABI");
 
-    let abi_json: Value =
-        serde_json::from_str(&abi_string).expect("Could not turn ABI string to JSON");
+    let abiJson: Value = serde_json::from_str(&abiString).expect("Could not turn ABI string to JSON");
 
-    let abi_items: Vec<Value> = match abi_json {
+     let abi_items: Vec<Value> = match abiJson {
         Value::Array(items) => items,
-        _other => panic!("ABI JSON is of invalid form"),
+        other => panic!("ABI JSON is of invalid form"),
     };
 
     let deposited_event = abi_items
@@ -59,17 +57,15 @@ async fn main(){
     let signature = format!("{}({})", name, types.join(","));
     println!("Derived event signature: {}", signature);         
 
-    let topic_to_look_for = keccak256(signature.as_bytes());
+    let topicToLookFor= keccak256(signature.as_bytes());
 
-    let deployments_json_path: &str = "../relayerContracts/data/deployments.json";
+    let addressesJson: &str = "../relayerContracts/data/deployments.json";
 
-    let deployments_json_string: String = fs::read_to_string(deployments_json_path)
-        .expect("Deployments Json could not be read");
+    let addressesString: String = fs::read_to_string(addressesJson).expect("Deployments Json could not be read");
     
-    let deployments_json: Value = serde_json::from_str(&deployments_json_string)
-        .expect("Could not parse deployments.json");
+    let addressesJsonVal: Value =serde_json::from_str(&addressesString).expect("Could not parse deployments.json");
 
-    let deposit_addr_str: &str = deployments_json
+    let deposit_addr_str: &str = addressesJsonVal
         .get("deposit")
         .and_then(|v| v.as_str())
         .expect("deployments.json missing string field 'deposit'");
@@ -79,7 +75,7 @@ async fn main(){
 
     println!("Deposit address: {:?}", deposit_address);
 
-    let provider = ProviderBuilder::new().connect_http(CHAIN_A_URL.parse().expect("bad CHAINA_URL"));
+    let provider = ProviderBuilder::new().connect_http(CHAINA_URL.parse().expect("bad CHAINA_URL"));
    
     let mut last_scanned_block: u64 = provider
         .get_block_number()
@@ -123,7 +119,7 @@ async fn main(){
         };
 
         for log in logs{
-            if log.topics().first() != Some(&topic_to_look_for) {
+            if log.topics().first() != Some(&topicToLookFor) {
                 println!("Current topic is not of interest");
                 continue;
             }
