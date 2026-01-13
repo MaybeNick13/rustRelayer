@@ -1,22 +1,53 @@
-use alloy::{primitives::{keccak256,Address}, providers::{Provider, ProviderBuilder}, rpc::types::Filter};
-use serde_json::Value;
-use std::{fs, str::FromStr,thread::{self, current}};
-use tokio::time::{sleep, Duration};
 
+use alloy::{primitives::{keccak256,Address}, providers::{Provider, ProviderBuilder}, rpc::types::Filter, dyn_abi::{DynSolType, DynSolValue}};
+use serde_json::Value;
+use serde::{Deserialize, Serialize};
+use std::{fs, str::FromStr};
+use tokio::time::{sleep, Duration};
+use rustRelayer::DepositMessage;
+use lapin::{
+    BasicProperties, Connection, ConnectionProperties,options::*,
+    types::FieldTable,
+};
 
 
 static CHAINA_URL: &str = "http://localhost:8545";
+const CHECKPOINT_PATH: &str = "data/subscriber_checkpoint.json";
+
+
+const RABBITMQ_URL: &str = "amqp://guest:guest@localhost:5672";
+const QUEUE_NAME: &str = "deposit_events";
 
 struct ProcessedTransaction{
     block_number: u64,
     tx_hash: String,
     log_index: u64,
 }
-                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              static CHECKPOINT_PATH: &str = "data/subscriber_checkpoint.json";
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        
 
 
 #[tokio::main]
 async fn main(){
+
+    let conn = Connection::connect(RABBITMQ_URL, ConnectionProperties::default())
+        .await
+        .expect("Failed to connect to RabbitMQ");
+
+    let channel = conn.create_channel()
+        .await
+        .expect("Failed to create channel");
+
+    channel
+        .queue_declare(
+            QUEUE_NAME,
+            QueueDeclareOptions::default(),
+            FieldTable::default(),
+        )
+        .await
+        .expect("Failed to declare queue");
+
+    println!("Connected to RabbitMQ, queue '{}'", QUEUE_NAME);
+     
     let deposit_abi_path: &str = "../relayerContracts/data/Deposit.abi.json";
     let abiString: String = fs::read_to_string(deposit_abi_path).expect("Can not read Deposit ABI");
 
@@ -119,8 +150,7 @@ async fn main(){
         };
 
         for log in logs{
-            if log.topics().first() != Some(&topicToLookFor) {
-                println!("Current topic is not of interest");
+            if log.topics()[0] != topicToLookFor{
                 continue;
             }
 
@@ -133,6 +163,44 @@ async fn main(){
                 tx_hash: format!("{tx_hash:?}"),
                 log_index,
             };
+
+            let senderBytes =  Address::from_slice(&log.topics()[1].as_slice()[12..]); //first 12 bytes are filler
+            let sender = format!("{senderBytes:?}");
+
+            let log_data = log.data().data.as_ref();
+
+            let amount = match DynSolType::String
+                .abi_decode(log_data)
+                .expect("failed to decode amount from log.data")
+            {
+                DynSolValue::String(s) => s,
+                other => panic!("expected string amount, got {other:?}"),
+            };
+
+
+            
+
+            let messageForIncluder = DepositMessage{
+                sender,
+                amount,
+                block_number,
+                tx_hash: format!("{tx_hash:?}"),
+                log_index
+            };
+
+            let payload = serde_json::to_vec(&messageForIncluder).expect("Payload error");
+            
+             channel.basic_publish(
+                    "",
+                    QUEUE_NAME,
+                    BasicPublishOptions::default(),
+                    payload.as_slice(),
+                    BasicProperties::default(),
+                )
+                .await
+                .expect("Message could not be sent");
+
+
 
             println!("Found transaction {}", current_tx.tx_hash);
             last_seen = Some(current_tx);

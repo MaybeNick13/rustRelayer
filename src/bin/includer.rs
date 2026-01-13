@@ -1,60 +1,49 @@
 use alloy::{
-    primitives::{keccak256, Address},
-    providers::{Provider, ProviderBuilder},
-    rpc::types::Filter,
+    network::EthereumWallet,
+    primitives::Address,
+    providers::ProviderBuilder,
+    signers::local::PrivateKeySigner,
+    sol,
 };
+use futures_util::StreamExt;
+use lapin::{
+    options::*,
+    types::FieldTable,
+    BasicProperties, Connection, ConnectionProperties,
+};
+use rustRelayer::DepositMessage;
 use serde_json::Value;
 use std::{fs, str::FromStr};
-use tokio::time::{sleep, Duration};
 
-const CHAIN_B_URL: &str = "http://localhost:8546";
-const CHECKPOINT_PATH: &str = "data/subscriber_checkpoint.json";
+static CHAIN_B_URL: &str = "http://localhost:8546";
+static PRIVATE_KEY: &str =
+    "0x59c6995e998f97a5a0044966f0945389dc9e86dae88c7a8412f4603b6b78690d";
+
+const RABBITMQ_URL: &str = "amqp://guest:guest@localhost:5672";
+const QUEUE_NAME: &str = "deposit_events";
+
+
 
 
 #[tokio::main]
 async fn main(){
-    let token_abi_path: &str = "../relayerContracts/data/token.abi.json";
-    let abi_string: String = fs::read_to_string(token_abi_path).expect("Can not read token ABI");
+    let conn = Connection::connect(RABBITMQ_URL, ConnectionProperties::default())
+        .await
+        .expect("Failed to connect to RabbitMQ");
 
-    let abi_json: Value =
-        serde_json::from_str(&abi_string).expect("Could not turn ABI string to JSON");
+    let channel = conn.create_channel()
+        .await
+        .expect("Failed to create channel");
 
-    let abi_items: Vec<Value> = match abi_json {
-        Value::Array(items) => items,
-        _other => panic!("ABI JSON is of invalid form"),
-    };
+    channel.queue_declare(
+            QUEUE_NAME,
+            QueueDeclareOptions::default(),
+            FieldTable::default(),
+        )
+        .await
+        .expect("Failed to declare queue");
 
-    let tokened_event = abi_items
-        .iter()
-        .find(|item| {
-            item.get("type").and_then(|v| v.as_str()) == Some("event")
-                && item.get("name").and_then(|v| v.as_str()) == Some("tokened")
-        })
-        .expect("ABI does not contain event tokened");
-
-    let name = tokened_event
-        .get("name")
-        .and_then(|v| v.as_str())
-        .expect("event ABI missing 'name'");
-
-    let inputs = tokened_event
-        .get("inputs")
-        .and_then(|v| v.as_array())
-        .expect("event ABI missing 'inputs' array");
-
-    let types: Vec<&str> = inputs
-        .iter()
-        .map(|inp| {
-            inp.get("type")
-                .and_then(|v| v.as_str())
-                .expect("event input missing 'type'")
-        })
-        .collect();
-
-    let signature = format!("{}({})", name, types.join(","));
-    println!("Derived event signature: {}", signature);         
-
-    let topic_to_look_for = keccak256(signature.as_bytes());
+    println!("Connected to RabbitMQ, queue '{}'", QUEUE_NAME);
 
     let deployments_json_path: &str = "../relayerContracts/data/deployments.json";
 
@@ -74,5 +63,48 @@ async fn main(){
 
     println!("token address: {:?}", token_address);
 
-    let provider = ProviderBuilder::new().connect_http(CHAIN_A_URL.parse().expect("bad CHAINA_URL"));
+
+ 
+    let signer = PrivateKeySigner::from_str(PRIVATE_KEY).expect("bad PRIVATE_KEY");
+    let wallet = EthereumWallet::from(signer);
+
+    let provider = ProviderBuilder::new()
+        .wallet(wallet)
+        .connect_http(CHAIN_B_URL.parse().expect("bad CHAIN_B_URL"));
+    let token_contract = Token::new(token_address, &provider);
+
+
+    let mut consumer = channel
+        .basic_consume(
+            QUEUE_NAME,
+            "includer_consumer",
+            BasicConsumeOptions::default(),
+            FieldTable::default(),
+        )
+        .await
+        .expect("Failed to create consumer");
+
+    println!("Includer is waiting for messages...");
+    while let Some(delivery) = consumer.next().await {
+        let delivery = delivery.expect("consumer delivery error");
+
+        let msg: DepositMessage =
+            serde_json::from_slice(&delivery.data).expect("invalid DepositMessage JSON");
+
+        println!(
+            "Received deposit: sender={}, amount={}, tx_hash={}, log_index={}",
+            msg.sender, msg.amount, msg.tx_hash, msg.log_index
+        );
+
+        token_contract
+            .mint(msg.amount)
+            .send()
+            .await
+            .expect("mint tx failed to send");
+
+        delivery
+            .ack(BasicAckOptions::default())
+            .await
+            .expect("ack failed");
+    }
 }
