@@ -1,15 +1,17 @@
 use alloy::{
     network::EthereumWallet,
     primitives::Address,
-    providers::ProviderBuilder,
+    providers::{Provider, ProviderBuilder},
     signers::local::PrivateKeySigner,
+    rpc::types::TransactionRequest,
     sol,
+    sol_types::SolCall,
 };
 use futures_util::StreamExt;
 use lapin::{
     options::*,
     types::FieldTable,
-    BasicProperties, Connection, ConnectionProperties,
+    Connection, ConnectionProperties,
 };
 use rustRelayer::DepositMessage;
 use serde_json::Value;
@@ -22,7 +24,12 @@ static PRIVATE_KEY: &str =
 const RABBITMQ_URL: &str = "amqp://guest:guest@localhost:5672";
 const QUEUE_NAME: &str = "deposit_events";
 
-
+sol! {
+    #[sol(rpc)]
+    contract Token {
+        function mint(string amount) external;
+    }
+}
 
 
 #[tokio::main]
@@ -71,8 +78,8 @@ async fn main(){
     let provider = ProviderBuilder::new()
         .wallet(wallet)
         .connect_http(CHAIN_B_URL.parse().expect("bad CHAIN_B_URL"));
-    let token_contract = Token::new(token_address, &provider);
-
+    
+    let token = Token::new(token_address, provider.clone());
 
     let mut consumer = channel
         .basic_consume(
@@ -96,11 +103,17 @@ async fn main(){
             msg.sender, msg.amount, msg.tx_hash, msg.log_index
         );
 
-        token_contract
-            .mint(msg.amount)
-            .send()
-            .await
-            .expect("mint tx failed to send");
+        let tx_hash = token
+        .mint(msg.amount.clone())
+        .send()
+        .await
+        .expect("mint send failed")
+        .watch()
+        .await
+        .expect("mint watch failed");
+
+        println!("Mint tx mined: {tx_hash:?}");
+
 
         delivery
             .ack(BasicAckOptions::default())
