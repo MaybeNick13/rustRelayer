@@ -207,6 +207,7 @@ async fn main(){
             
 
         }
+        last_scanned_block = head
 
     }
 
