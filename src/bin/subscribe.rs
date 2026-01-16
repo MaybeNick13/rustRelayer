@@ -1,22 +1,14 @@
-
 use alloy::{primitives::{keccak256,Address}, providers::{Provider, ProviderBuilder}, rpc::types::Filter, dyn_abi::{DynSolType, DynSolValue}};
 use serde_json::Value;
-use serde::{Deserialize, Serialize};
-use std::{fs, str::FromStr};
+use std::{env, fs, str::FromStr};
 use tokio::time::{sleep, Duration};
 use rustRelayer::DepositMessage;
 use lapin::{
     BasicProperties, Connection, ConnectionProperties,options::*,
     types::FieldTable,
 };
+use sqlx::postgres::PgPoolOptions;
 
-
-static CHAINA_URL: &str = "http://localhost:8545";
-const CHECKPOINT_PATH: &str = "data/subscriber_checkpoint.json";
-
-
-const RABBITMQ_URL: &str = "amqp://guest:guest@localhost:5672";
-const QUEUE_NAME: &str = "deposit_events";
 
 struct ProcessedTransaction{
     block_number: u64,
@@ -27,9 +19,34 @@ struct ProcessedTransaction{
 
 
 #[tokio::main]
-async fn main(){
+async fn main() {
+    dotenvy::dotenv().ok();
 
-    let conn = Connection::connect(RABBITMQ_URL, ConnectionProperties::default())
+    let database_url = env::var("DATABASE_URL").expect("DATABASE_URL not set");
+    let service_name = env::var("SERVICE_NAME").expect("SERVICE_NAME not set");
+    let database_client = PgPoolOptions::new()
+        .max_connections(5)
+        .connect(&database_url)
+        .await
+        .expect("Failed to connect to Postgres");
+
+    let chain_a_url = env::var("CHAINA_URL").expect("CHAINA_URL not set");
+    let rabbitmq_url = env::var("RABBITMQ_URL").expect("RABBITMQ_URL not set");
+    let queue_name = env::var("QUEUE_NAME").expect("QUEUE_NAME not set");
+    let _checkpoint_path = env::var("CHECKPOINT_PATH").expect("CHECKPOINT_PATH not set");
+
+    let reorg_value: Option<String> = sqlx::query_scalar(
+        "select value from process_settings where setting = 'reorg_buffer_blocks'",
+    )
+    .fetch_optional(&database_client)
+    .await
+    .expect("Failed to read process_settings");
+
+    let reorg_buffer_blocks: u64 = reorg_value
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(10);
+
+    let conn = Connection::connect(&rabbitmq_url, ConnectionProperties::default())
         .await
         .expect("Failed to connect to RabbitMQ");
 
@@ -39,14 +56,14 @@ async fn main(){
 
     channel
         .queue_declare(
-            QUEUE_NAME,
+            &queue_name,
             QueueDeclareOptions::default(),
             FieldTable::default(),
         )
         .await
         .expect("Failed to declare queue");
 
-    println!("Connected to RabbitMQ, queue '{}'", QUEUE_NAME);
+    println!("Connected to RabbitMQ, queue '{}'", queue_name);
      
     let deposit_abi_path: &str = "../relayerContracts/data/Deposit.abi.json";
     let abiString: String = fs::read_to_string(deposit_abi_path).expect("Can not read Deposit ABI");
@@ -106,12 +123,35 @@ async fn main(){
 
     println!("Deposit address: {:?}", deposit_address);
 
-    let provider = ProviderBuilder::new().connect_http(CHAINA_URL.parse().expect("bad CHAINA_URL"));
+    let provider = ProviderBuilder::new().connect_http(chain_a_url.parse().expect("bad CHAINA_URL"));
    
-    let mut last_scanned_block: u64 = provider
+    let head_now: u64 = provider
         .get_block_number()
         .await
         .expect("get_block_number failed");
+
+    let saved_last_scanned_block: Option<i64> = sqlx::query_scalar(
+        "select last_scanned_block from subscriber_state where service_name = $1",
+    )
+    .bind(&service_name)
+    .fetch_optional(&database_client)
+    .await
+    .expect("Failed to read subscriber_state");
+
+    let saved_last_scanned_block = saved_last_scanned_block.map(|v| v as u64);
+
+    let mut last_scanned_block = head_now;
+    if let Some(saved) = saved_last_scanned_block {
+        if saved <= head_now {
+            last_scanned_block = saved;
+        } else {
+            println!("Chain was restarted (cursor ahead of head); starting at head {head_now}");
+        }
+    } else {
+        println!("Chain was restarted (no cursor); starting at head {head_now}");
+    }
+
+    last_scanned_block = last_scanned_block.saturating_sub(reorg_buffer_blocks);
 
     println!("Starting at head block {}", last_scanned_block);
 
@@ -181,18 +221,43 @@ async fn main(){
             
 
             let messageForIncluder = DepositMessage{
-                sender,
-                amount,
+                sender: sender.clone(),
+                amount: amount.clone(),
                 block_number,
                 tx_hash: format!("{tx_hash:?}"),
                 log_index
             };
 
+            let payload_json = sqlx::types::Json(messageForIncluder.clone());
+            let rows = sqlx::query(
+                "insert into subscriber_published_deposits \
+                (source_tx_hash, source_log_index, source_block, sender, amount, queue_name, payload) \
+                values ($1,$2,$3,$4,$5,$6,$7) \
+                on conflict (source_tx_hash, source_log_index) do nothing",
+            )
+            .bind(&messageForIncluder.tx_hash)
+            .bind(messageForIncluder.log_index as i64)
+            .bind(messageForIncluder.block_number as i64)
+            .bind(&sender)
+            .bind(&amount)
+            .bind(&queue_name)
+            .bind(payload_json)
+            .execute(&database_client)
+            .await
+            .expect("Failed to insert subscriber_published_deposits")
+            .rows_affected();
+
+            let inserted = rows == 1;
+
+            if !inserted {
+                continue;
+            }
+
             let payload = serde_json::to_vec(&messageForIncluder).expect("Payload error");
             
              channel.basic_publish(
                     "",
-                    QUEUE_NAME,
+                      &queue_name,
                     BasicPublishOptions::default(),
                     payload.as_slice(),
                     BasicProperties::default(),
@@ -208,6 +273,15 @@ async fn main(){
 
         }
         last_scanned_block = head;
+        sqlx::query(
+            "insert into subscriber_state (service_name, last_scanned_block) values ($1,$2) \
+             on conflict (service_name) do update set last_scanned_block = excluded.last_scanned_block, updated_at = now()",
+        )
+        .bind(&service_name)
+        .bind(last_scanned_block as i64)
+        .execute(&database_client)
+        .await
+        .expect("Failed to update subscriber_state");
 
     }
 
@@ -221,6 +295,4 @@ async fn main(){
     
 
     
-
-
 }

@@ -1,11 +1,9 @@
 use alloy::{
     network::EthereumWallet,
     primitives::Address,
-    providers::{Provider, ProviderBuilder},
+    providers::ProviderBuilder,
     signers::local::PrivateKeySigner,
-    rpc::types::TransactionRequest,
     sol,
-    sol_types::SolCall,
 };
 use futures_util::StreamExt;
 use lapin::{
@@ -15,14 +13,8 @@ use lapin::{
 };
 use rustRelayer::DepositMessage;
 use serde_json::Value;
-use std::{fs, str::FromStr};
-
-static CHAIN_B_URL: &str = "http://localhost:8546";
-static PRIVATE_KEY: &str =
-    "0x59c6995e998f97a5a0044966f0945389dc9e86dae88c7a8412f4603b6b78690d";
-
-const RABBITMQ_URL: &str = "amqp://guest:guest@localhost:5672";
-const QUEUE_NAME: &str = "deposit_events";
+use std::{env, fs, str::FromStr};
+use sqlx::postgres::PgPoolOptions;
 
 sol! {
     #[sol(rpc)]
@@ -33,8 +25,23 @@ sol! {
 
 
 #[tokio::main]
-async fn main(){
-    let conn = Connection::connect(RABBITMQ_URL, ConnectionProperties::default())
+async fn main() {
+    dotenvy::dotenv().ok();
+
+    let database_url = env::var("DATABASE_URL").expect("DATABASE_URL not set");
+    let database_client = PgPoolOptions::new()
+        .max_connections(5)
+        .connect(&database_url)
+        .await
+        .expect("Failed to connect to Postgres");
+
+
+    let chain_b_url = env::var("CHAIN_B_URL").expect("CHAIN_B_URL not set");
+    let private_key = env::var("PRIVATE_KEY").expect("PRIVATE_KEY not set");
+    let rabbitmq_url = env::var("RABBITMQ_URL").expect("RABBITMQ_URL not set");
+    let queue_name = env::var("QUEUE_NAME").expect("QUEUE_NAME not set");
+
+    let conn = Connection::connect(&rabbitmq_url, ConnectionProperties::default())
         .await
         .expect("Failed to connect to RabbitMQ");
 
@@ -43,14 +50,14 @@ async fn main(){
         .expect("Failed to create channel");
 
     channel.queue_declare(
-            QUEUE_NAME,
+            &queue_name,
             QueueDeclareOptions::default(),
             FieldTable::default(),
         )
         .await
         .expect("Failed to declare queue");
 
-    println!("Connected to RabbitMQ, queue '{}'", QUEUE_NAME);
+    println!("Connected to RabbitMQ, queue '{}'", queue_name);
 
     let deployments_json_path: &str = "../relayerContracts/data/deployments.json";
 
@@ -72,18 +79,18 @@ async fn main(){
 
 
  
-    let signer = PrivateKeySigner::from_str(PRIVATE_KEY).expect("bad PRIVATE_KEY");
+    let signer = PrivateKeySigner::from_str(&private_key).expect("bad PRIVATE_KEY");
     let wallet = EthereumWallet::from(signer);
 
     let provider = ProviderBuilder::new()
         .wallet(wallet)
-        .connect_http(CHAIN_B_URL.parse().expect("bad CHAIN_B_URL"));
+        .connect_http(chain_b_url.parse().expect("bad CHAIN_B_URL"));
     
     let token = Token::new(token_address, provider.clone());
 
     let mut consumer = channel
         .basic_consume(
-            QUEUE_NAME,
+            &queue_name,
             "includer_consumer",
             BasicConsumeOptions::default(),
             FieldTable::default(),
@@ -103,16 +110,69 @@ async fn main(){
             msg.sender, msg.amount, msg.tx_hash, msg.log_index
         );
 
-        let tx_hash = token
-        .mint(msg.amount.clone())
-        .send()
+        // If we've already processed this (tx_hash, log_index), just ack and skip.
+        let rows = sqlx::query(
+            "insert into includer_mint_calls (source_tx_hash, source_log_index, token_address, amount) \
+             values ($1,$2,$3,$4) \
+             on conflict (source_tx_hash, source_log_index) do nothing",
+        )
+        .bind(&msg.tx_hash)
+        .bind(msg.log_index as i64)
+        .bind(format!("{token_address:?}"))
+        .bind(&msg.amount)
+        .execute(&database_client)
         .await
-        .expect("mint send failed")
-        .watch()
-        .await
-        .expect("mint watch failed");
+        .expect("Failed to insert includer_mint_calls")
+        .rows_affected();
 
-        println!("Mint tx mined: {tx_hash:?}");
+        let inserted = rows == 1;
+
+        if !inserted {
+            delivery
+                .ack(BasicAckOptions::default())
+                .await
+                .expect("ack failed");
+            continue;
+        }
+
+        let mint_res = token
+            .mint(msg.amount.clone())
+            .send()
+            .await;
+
+        match mint_res {
+            Ok(pending) => {
+                let tx_hash = pending
+                    .watch()
+                    .await
+                    .expect("mint watch failed");
+
+                println!("Mint tx mined: {tx_hash:?}");
+
+                sqlx::query(
+                    "update includer_mint_calls set dest_tx_hash = $3, success = true, updated_at = now() \
+                     where source_tx_hash = $1 and source_log_index = $2",
+                )
+                .bind(&msg.tx_hash)
+                .bind(msg.log_index as i64)
+                .bind(format!("{tx_hash:?}"))
+                .execute(&database_client)
+                .await
+                .expect("Failed to update includer_mint_calls");
+            }
+            Err(e) => {
+                sqlx::query(
+                    "update includer_mint_calls set success = false, error = $3, updated_at = now() \
+                     where source_tx_hash = $1 and source_log_index = $2",
+                )
+                .bind(&msg.tx_hash)
+                .bind(msg.log_index as i64)
+                .bind(format!("{e:?}"))
+                .execute(&database_client)
+                .await
+                .expect("Failed to update includer_mint_calls error");
+            }
+        }
 
 
         delivery
