@@ -229,6 +229,18 @@ async fn main() {
             };
 
             let payload_json = sqlx::types::Json(messageForIncluder.clone());
+
+            let payload = serde_json::to_vec(&messageForIncluder).expect("Payload error");
+            
+            channel.basic_publish(
+                "",
+                    &queue_name,
+                BasicPublishOptions::default(),
+                payload.as_slice(),
+                BasicProperties::default(),
+            )
+            .await
+            .expect("Message could not be sent");
             let rows = sqlx::query(
                 "insert into subscriber_published_deposits \
                 (source_tx_hash, source_log_index, source_block, sender, amount, queue_name, payload) \
@@ -252,18 +264,6 @@ async fn main() {
             if !inserted {
                 continue;
             }
-
-            let payload = serde_json::to_vec(&messageForIncluder).expect("Payload error");
-            
-             channel.basic_publish(
-                    "",
-                      &queue_name,
-                    BasicPublishOptions::default(),
-                    payload.as_slice(),
-                    BasicProperties::default(),
-                )
-                .await
-                .expect("Message could not be sent");
 
 
 
